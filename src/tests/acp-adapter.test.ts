@@ -667,6 +667,48 @@ new AgentSideConnection((connection) => new FakeAgent(connection), stream);
     expect(resolveAcpTarget(config).env(config).OPENCODE_CONFIG_CONTENT).toBe(content);
   });
 
+  test("OpenCode preset adds the helmcode block with an {env:} key reference, never the key", () => {
+    const sentinel = "sk-helmcode-acp-sentinel-0123456789";
+    const config = baseConfig({
+      model: "helmcode/glm5.3",
+      env: {
+        ACP_TARGET: "opencode",
+        HELMCODE_API_KEY: sentinel,
+        OPENCODE_CONFIG_CONTENT: JSON.stringify({
+          provider: { helmcode: { options: { timeout: 1000 } } },
+        }),
+      },
+    });
+    const env = resolveAcpTarget(config).env(config);
+    expect(env.HELMCODE_API_KEY).toBe(sentinel);
+    expect(env.OPENCODE_CONFIG_CONTENT).not.toContain(sentinel);
+    const helmcode = JSON.parse(env.OPENCODE_CONFIG_CONTENT!).provider.helmcode;
+    expect(helmcode).toMatchObject({
+      npm: "@ai-sdk/openai-compatible",
+      name: "Helmcode",
+      env: [],
+      options: {
+        baseURL: "https://api.helmcode.com/v1",
+        apiKey: "{env:HELMCODE_API_KEY}",
+        timeout: 1000,
+      },
+    });
+    expect(helmcode.models["glm5.3"]).toMatchObject({
+      tool_call: true,
+      limit: { context: 1048576, output: 32768 },
+    });
+  });
+
+  test("OpenCode preset adds no custom block for a nan model", () => {
+    const config = baseConfig({
+      model: "nan/glm5.3-flash",
+      env: { ACP_TARGET: "opencode", NAN_API_KEY: "example-test-key" },
+    });
+    const env = resolveAcpTarget(config).env(config);
+    expect(env.NAN_API_KEY).toBe("example-test-key");
+    expect(JSON.parse(env.OPENCODE_CONFIG_CONTENT!).provider?.helmcode).toBeUndefined();
+  });
+
   test("OpenCode preset injects gateway even without a model fallback", () => {
     const config = baseConfig({
       model: "",
@@ -740,6 +782,135 @@ new AgentSideConnection((connection) => new FakeAgent(connection), stream);
     await target.writeSystemPromptArtifact(config);
 
     expect(target.env(config).GEMINI_SYSTEM_MD).toBeUndefined();
+  });
+
+  test("Qwen preset picks the OpenAI-compatible auth type, puts the model on argv, and forwards only its keys", () => {
+    const config = baseConfig({
+      model: "gpt-4.1-mini",
+      env: {
+        PATH: "/bin",
+        ACP_TARGET: "qwen",
+        OPENAI_API_KEY: "example-openai-key",
+        OPENAI_BASE_URL: "https://llm.example/v1",
+        ACP_CONFIG_OPTIONS: JSON.stringify({ mode: "yolo" }),
+        GITHUB_TOKEN: "example-git-token",
+      },
+    });
+    const target = resolveAcpTarget(config);
+
+    expect(target.target).toBe("qwen");
+    expect(target.command(config)).toEqual([
+      "qwen",
+      "--acp",
+      "--auth-type",
+      "openai",
+      "--model",
+      "gpt-4.1-mini",
+    ]);
+    const env = target.env(config);
+    expect(env).toMatchObject({
+      OPENAI_API_KEY: "example-openai-key",
+      OPENAI_BASE_URL: "https://llm.example/v1",
+    });
+    expect(env.GITHUB_TOKEN).toBeUndefined();
+    // The ACP `model` option wants `<id>(<authType>)`; argv already carries it.
+    expect(target.configuredOptions(config)).toEqual({ mode: "yolo" });
+  });
+
+  test("Qwen preset honours QWEN_AUTH_TYPE and rejects an unknown or browser-only one", () => {
+    const anthropic = baseConfig({
+      model: "",
+      env: { PATH: "/bin", ACP_TARGET: "qwen", QWEN_AUTH_TYPE: "anthropic" },
+    });
+    expect(resolveAcpTarget(anthropic).command(anthropic)).toEqual([
+      "qwen",
+      "--acp",
+      "--auth-type",
+      "anthropic",
+    ]);
+    const oauth = baseConfig({
+      env: { PATH: "/bin", ACP_TARGET: "qwen", QWEN_AUTH_TYPE: "qwen-oauth" },
+    });
+    expect(() => resolveAcpTarget(oauth).command(oauth)).toThrow(AcpTargetResolutionError);
+  });
+
+  test("Qwen preset writes the system prompt outside the cwd and removes it on cleanup", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "acp-qwen-cwd-"));
+    try {
+      const config = baseConfig({
+        cwd,
+        systemPrompt: "You are a swarm worker.",
+        env: { PATH: "/bin", ACP_TARGET: "qwen" },
+      });
+      const target = resolveAcpTarget(config);
+      await target.writeSystemPromptArtifact(config);
+      const path = target.env(config).QWEN_SYSTEM_MD;
+
+      expect(path).toBeDefined();
+      expect(path!.startsWith(cwd)).toBe(false);
+      expect(await Bun.file(path!).text()).toBe("You are a swarm worker.");
+      await target.cleanupSystemPromptArtifact?.(config);
+      expect(existsSync(path!)).toBe(false);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("Kiro preset forwards KIRO_API_KEY and puts the model on argv", () => {
+    const config = baseConfig({
+      model: "claude-sonnet-4.5",
+      env: {
+        PATH: "/bin",
+        ACP_TARGET: "kiro",
+        KIRO_API_KEY: "ksk_example",
+        OPENAI_API_KEY: "not-for-kiro",
+      },
+    });
+    const target = resolveAcpTarget(config);
+
+    expect(target.target).toBe("kiro");
+    expect(target.command(config)).toEqual(["kiro-cli", "acp", "--model", "claude-sonnet-4.5"]);
+    const env = target.env(config);
+    expect(env.KIRO_API_KEY).toBe("ksk_example");
+    expect(env.OPENAI_API_KEY).toBeUndefined();
+  });
+
+  test("Goose preset disables the keyring, falls back to GOOSE_MODEL, and injects the prompt per turn", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "acp-goose-cwd-"));
+    try {
+      const config = baseConfig({
+        cwd,
+        model: "gpt-4.1-mini",
+        systemPrompt: "You are a swarm worker.",
+        env: {
+          PATH: "/bin",
+          ACP_TARGET: "goose",
+          GOOSE_PROVIDER: "openai",
+          OPENAI_API_KEY: "example-openai-key",
+          GITHUB_TOKEN: "example-git-token",
+        },
+      });
+      const target = resolveAcpTarget(config);
+      await target.writeSystemPromptArtifact(config);
+
+      expect(target.target).toBe("goose");
+      expect(target.command(config)).toEqual(["goose", "acp"]);
+      const env = target.env(config);
+      expect(env).toMatchObject({
+        GOOSE_PROVIDER: "openai",
+        GOOSE_MODEL: "gpt-4.1-mini",
+        GOOSE_DISABLE_KEYRING: "1",
+        OPENAI_API_KEY: "example-openai-key",
+      });
+      expect(env.GITHUB_TOKEN).toBeUndefined();
+      const path = env.GOOSE_MOIM_MESSAGE_FILE;
+      expect(path!.startsWith(cwd)).toBe(false);
+      expect(await Bun.file(path!).text()).toBe("You are a swarm worker.");
+      await target.cleanupSystemPromptArtifact?.(config);
+      expect(existsSync(path!)).toBe(false);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
   });
 
   test("Copilot preset forwards its own credentials, pins the model, and never forwards GITHUB_TOKEN", () => {

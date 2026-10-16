@@ -8,6 +8,7 @@ export const MODEL_SOURCE_LABELS: Record<ModelSource, string> = {
   "tier-config": "Tier config",
   "tier-default": "Tier default",
   "fallback:cli-unsupported": "Fallback (CLI rejected the requested model)",
+  "fallback:cli-unsupported:model": "Fallback (CLI rejected the task's own model)",
 };
 
 export function modelSourceLabel(source: string): string {
@@ -18,6 +19,16 @@ type TaskModelFields = Pick<
   AgentTask,
   "model" | "modelTier" | "resolvedModel" | "modelSource" | "modelAlias"
 >;
+
+/**
+ * The effort a task ran at, else the effort it asked for. Undefined on rows
+ * from before effort was recorded, and when the harness default applied.
+ */
+export function taskDisplayEffort(
+  task: Pick<AgentTask, "effort" | "resolvedEffort">,
+): AgentTask["effort"] {
+  return task.resolvedEffort ?? task.effort;
+}
 
 /**
  * The model a task ran (or will run) on: the server's claim-time resolution
